@@ -13,6 +13,7 @@ EMAIL        = os.environ.get('EMAIL') or ""           # 登录邮箱,可选，�
 PASSWORD     = os.environ.get('PASSWORD') or ""        # 登录密码,可选，作为备用, 建议填写
 TG_CHAT_ID   = os.environ.get('TG_CHAT_ID') or ""      # Telegram Chat ID,可选，通知
 TG_BOT_TOKEN = os.environ.get('TG_BOT_TOKEN') or ""    # Telegram Bot Token,可选
+SERVER_NAME  = os.environ.get('SERVER_NAME') or os.environ.get('SERVER') or os.environ.get('HOST_NAME') or "" # 服务器名称/备注
 
 BASE_URL = "https://dash.hidencloud.com"
 LOGIN_URL = f"{BASE_URL}/auth/login"
@@ -63,49 +64,83 @@ def get_current_ip(proxy_server=None):
         log(f"❌ 获取出口IP失败: {e}")
         return "获取失败"
 
-def send_telegram_notification(status, old_due, new_due):
-    """发送 Telegram 通知"""
+def send_telegram_notification(status, old_due="未知", new_due="未知", server_id=None, detail=None):
+    """发送 Telegram 通知 (优化版 HTML 排版)"""
     if not TG_BOT_TOKEN or not TG_CHAT_ID:
         log("⚠️ Telegram 未配置，跳过通知")
         return False
 
-    # 获取运行时间
+    # 1. 计算服务器展示名称
+    if SERVER_NAME and server_id:
+        display_server = f"{SERVER_NAME} (#{server_id})"
+    elif SERVER_NAME:
+        display_server = SERVER_NAME
+    elif server_id:
+        display_server = f"Free Server #{server_id}"
+    else:
+        display_server = "HidenCloud 实例"
+
+    # 2. 格式化当前执行时间 (UTC+8)
     local_time = time.gmtime(time.time() + 8 * 3600)
     now = time.strftime("%Y-%m-%d %H:%M:%S", local_time)
+
+    # 3. 邮箱脱敏处理
     if '@' in EMAIL:
         name, domain = EMAIL.split('@', 1)
-        if len(name) > 4:
-            masked_EMAIL = f"{name[:2]}****{name[-2:]}@{domain}"
-        else:
-            masked_EMAIL = f"{name}@{domain}"
+        masked_email = f"{name[:2]}****{name[-2:]}@{domain}" if len(name) > 4 else f"{name}@{domain}"
+    elif EMAIL:
+        masked_email = EMAIL[:2] + '****'
     else:
-        masked_EMAIL = EMAIL[:2] + '****'
+        masked_email = "Cookie 免密登录"
 
-    text = (
-        f"🎉 HidenCloud 续期通知\n\n"
-        f"{status}\n"
-        f"👤 账号: {masked_EMAIL}\n"
-        f"📅 续期前到期：{old_due}\n"
-        f"📅 续期后到期：{new_due}\n"
-        f"🕒 续期时间：{now}"
-    )
+    # 4. 获取当前出口 IP
+    current_ip = get_current_ip(PROXY_SERVER if IS_PROXY else None)
+
+    # 5. 构建优雅的 HTML 格式消息
+    lines = [
+        "<b>🔔 HidenCloud 自动续期提醒</b>",
+        "",
+        f"🖥️ <b>服务名称:</b> <code>{display_server}</code>",
+        f"📌 <b>执行状态:</b> <b>{status}</b>",
+        f"👤 <b>关联账号:</b> <code>{masked_email}</code>",
+        f"📅 <b>当前到期:</b> <code>{old_due}</code>",
+    ]
+
+    if new_due and new_due != "未知" and "失败" not in status and "异常" not in status:
+        lines.append(f"🎉 <b>续期后到期:</b> <code>{new_due}</code>")
+
+    if detail:
+        lines.append(f"ℹ️ <b>详情信息:</b> <i>{detail}</i>")
+
+    lines.extend([
+        f"🌐 <b>出口 IP:</b> <code>{current_ip}</code>",
+        f"🕒 <b>通知时间:</b> <code>{now} (UTC+8)</code>"
+    ])
+
+    text = "\n".join(lines)
     url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
     payload = {
         "chat_id": TG_CHAT_ID,
         "text": text,
-        "parse_mode": "HTML"
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True
     }
-    try:
-        resp = requests.post(url, json=payload, timeout=10, proxies=REQUESTS_PROXIES)
-        if resp.status_code == 200:
-            log("✅ Telegram 通知发送成功")
-            return True
-        else:
-            log(f"❌ Telegram 通知失败: {resp.text}")
-            return False
-    except Exception as e:
-        log(f"❌ Telegram 通知异常: {e}")
-        return False
+
+    # 6. 带重试的请求发送
+    for retry in range(2):
+        try:
+            resp = requests.post(url, json=payload, timeout=15, proxies=REQUESTS_PROXIES)
+            if resp.status_code == 200:
+                log("✅ Telegram 通知发送成功")
+                return True
+            else:
+                log(f"⚠️ Telegram 通知接口返回错误 (重试 {retry+1}/2): {resp.text}")
+        except Exception as e:
+            log(f"⚠️ Telegram 通知网络异常 (重试 {retry+1}/2): {e}")
+        time.sleep(2)
+
+    log("❌ Telegram 通知最终发送失败")
+    return False
 
 # =========================================================
 # Cloudflare Turnstile 处理
@@ -689,9 +724,11 @@ def main():
         f"EMAIL={'已配置' if EMAIL else '未配置'}, PASSWORD={'已配置' if PASSWORD else '未配置'}")
     if not COOKIE_VALUE and not (EMAIL and PASSWORD):
         log("❌ 缺少登录凭证")
+        send_telegram_notification("❌ 启动失败", detail="缺少必要的登录凭证 (COOKIE_VALUE / EMAIL / PASSWORD)")
         sys.exit(1)
 
     global SERVICE_URL
+    server_id = None
 
     with sync_playwright() as p:
         try:
@@ -720,12 +757,15 @@ def main():
             page.add_init_script(STEALTH_JS)
 
             if not login(page):
+                log("❌ 登录失败，发送通知并退出")
+                send_telegram_notification("❌ 登录失败", detail="Cookie 已失效且账号密码登录未通过")
                 sys.exit(1)
 
             # 登录成功后，自动获取 Server ID
             server_id = get_server_id(page)
             if not server_id:
                 log("❌ 无法获取 Server ID，退出。")
+                send_telegram_notification("❌ 获取机器ID失败", detail="登录成功但未能解析到有效服务 ID")
                 sys.exit(1)
             SERVICE_URL = f"{BASE_URL}/service/{server_id}/manage"
 
@@ -736,20 +776,30 @@ def main():
             # 执行续费
             renew_result = renew_service(page)
 
-            new_due = old_due
             if renew_result == "NOT_TIME":
                 log("⏳ 未到续期时间，目前无法续期")
-                status = "⏳ 未到续期时间"
+                status = "⏳ 尚未到续期时间"
+                new_due = old_due
+                detail = "未达到平台允许的续期窗口期"
             elif renew_result is False:
                 log("❌ 续费失败，脚本退出。")
-                status = "❌ 续期失败"
+                status = "❌ 续费操作失败"
+                new_due = old_due
+                detail = "未能成功提交发票或点击支付按钮"
             else:  # renew_result is True
                 new_due = get_due_date(page)
                 log(f"📆 续费后到期时间：{new_due}")
                 status = "✅ 续期成功"
+                detail = "服务已成功自动顺延到期日"
 
             # 发送 Telegram 通知
-            send_telegram_notification(status, old_due, new_due)
+            send_telegram_notification(
+                status=status,
+                old_due=old_due,
+                new_due=new_due,
+                server_id=server_id,
+                detail=detail
+            )
 
             if renew_result == "NOT_TIME":
                 sys.exit(0)
@@ -758,7 +808,12 @@ def main():
             else:
                 sys.exit(0)
         except Exception as e:
-            log(f"❌ 浏览器启动出错: {e}")
+            log(f"❌ 浏览器启动或运行出错: {e}")
+            send_telegram_notification(
+                status="❌ 脚本异常终止",
+                server_id=server_id,
+                detail=f"捕获未处理异常: {str(e)[:100]}"
+            )
             sys.exit(1)
         finally:
             if 'browser' in locals() and browser:
@@ -766,3 +821,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
