@@ -585,6 +585,7 @@ def get_due_date(page):
         if SERVICE_URL not in page.url:
             page.goto(SERVICE_URL, wait_until="domcontentloaded", timeout=60000)
         solve_turnstile(page, timeout=60, success_check=page_ready, reload_after=8)
+        time.sleep(3)  # 给页面充足时间渲染
         body_text = page.locator("body").inner_text()
         patterns = [
             r"Due date\s+(\d{1,2}\s+[A-Za-z]{3}\s+\d{4})",
@@ -602,49 +603,49 @@ def get_due_date(page):
     return "未知"
 
 def renew_service(page):
-
     try:
         log("➡ 进入续期流程...")
         if page.url != SERVICE_URL:
             page.goto(SERVICE_URL, wait_until="domcontentloaded", timeout=60000)
         solve_turnstile(page, timeout=60, success_check=page_ready, reload_after=8)
+        time.sleep(3)
 
         log("🖱️ 准备点击 'Renew' 按钮...")
         renew_btn = page.locator('button:has-text("Renew")')
         create_btn = page.locator('button:has-text("Create Invoice")')
 
         modal_opened = False
-        for i in range(6):
+        for i in range(5):
             try:
-                renew_btn.wait_for(state="visible", timeout=10000)
+                renew_btn.wait_for(state="visible", timeout=15000)
                 renew_btn.scroll_into_view_if_needed()
                 log(f"🖱️ 第 {i+1} 次尝试点击 'Renew'...")
                 renew_btn.click()
 
-                # 等待一小段时间，检测是否出现“未到续期时间”弹窗
-                time.sleep(2)
+                # 等待检测是否出现“未到续期时间”弹窗
+                time.sleep(3)
                 page_text = page.locator("body").inner_text()
                 if "Renewal Restricted" in page_text or "can only renew" in page_text.lower():
                     log("⚠️ 未到续期时间，无法续期。")
                     page.screenshot(path="renew_not_allowed.png")
                     return "NOT_TIME"   # 特殊状态
 
-                log("🖲️ 等待弹窗出现...")
-                try:
-                    create_btn.wait_for(state="visible", timeout=5000)
-                    modal_opened = True
-                    log("✅ 弹窗已成功弹出！")
-                    break
-                except:
-                    # 弹窗可能先展示 Turnstile，创建按钮稍后才出现
-                    if challenge_boxes(page):
+                log("🖲️ 等待弹窗出现 (最长 15s)...")
+                # 留出 15 秒充分等待弹窗与按钮渲染，避免过快重复点击导致弹窗关闭
+                for _ in range(15):
+                    if create_btn.is_visible() or challenge_boxes(page):
                         modal_opened = True
-                        log("✅ 弹窗已弹出（先出现 Turnstile 验证）！")
+                        log("✅ 弹窗已成功弹出！")
                         break
-                    log("⚠️ 弹窗未出现，可能是点击未响应，准备重试...")
-                    time.sleep(2)
+                    time.sleep(1)
+
+                if modal_opened:
+                    break
+                log("⚠️ 弹窗未出现，稍等重试...")
+                time.sleep(2)
             except Exception as e:
                 log(f"❌ 点击尝试出错: {e}")
+                time.sleep(2)
 
         if not modal_opened:
             log("❌ 错误：尝试多次后，续费弹窗仍未出现。")
@@ -653,9 +654,8 @@ def renew_service(page):
 
         # --- 弹窗内的 Turnstile：处理完再点 Create Invoice ---
         log("🛡️ 处理弹窗内的 Turnstile...")
-        if not solve_turnstile(page, timeout=90, require_positive=True,
-                               shot_on_timeout="modal_turnstile_fail.png"):
-            log("⚠️ 弹窗内 Turnstile 未确认通过，仍尝试点击 'Create Invoice'...")
+        solve_turnstile(page, timeout=90, require_positive=True,
+                        shot_on_timeout="modal_turnstile_fail.png")
 
         # 等待 Create Invoice 按钮就绪并点击
         try:
@@ -663,33 +663,47 @@ def renew_service(page):
         except Exception:
             pass
 
+        time.sleep(2)  # 给 2 秒让验证 token 充分挂载到 form
         create_clicked = False
         for i in range(3):
             try:
                 log(f"🖱️ 点击 'Create Invoice'（第 {i+1} 次）...")
-                create_btn.click(timeout=8000)
+                create_btn.click(timeout=10000)
                 create_clicked = True
                 break
             except Exception as e:
                 log(f"⚠️ 点击 'Create Invoice' 失败: {e}")
-                # 可能 token 还没生效，再处理一次 Turnstile
-                solve_turnstile(page, timeout=30, require_positive=True)
+                time.sleep(2)
         if not create_clicked:
             log("❌ 无法点击 'Create Invoice'。")
             page.screenshot(path="create_invoice_failed.png")
             return False
 
+        # --- 等待跳转到发票页面 ---
         new_invoice_url = None
         start_wait = time.time()
+        log("⏳ 等待跳转至发票页面 (最长等待 90 秒)...")
         while time.time() - start_wait < 90:
-            if "/payment/invoice/" in page.url:
-                new_invoice_url = page.url
-                log(f"🎉 页面已跳转: {new_invoice_url}")
+            curr_url = page.url
+            if "/payment/invoice/" in curr_url:
+                new_invoice_url = curr_url
+                log(f"🎉 页面已跳转至发票: {new_invoice_url}")
                 break
-            if page.locator('iframe[src*="challenges.cloudflare.com"]').count() > 0:
-                log("⚠️ 遇到拦截，尝试处理...")
-                solve_turnstile(page, timeout=45, reload_after=8)
-            time.sleep(1)
+
+            # 容错：若跳转意外退回到登录页，尝试自动恢复登录
+            if "/auth/login" in curr_url:
+                log("⚠️ 检测到页面跳转回登录页，尝试自动重新登录...")
+                if login(page):
+                    page.goto(SERVICE_URL, wait_until="domcontentloaded", timeout=60000)
+                break
+
+            # 只有当整页被 Cloudflare 拦截页面挡住（title含 Just a moment 等）时才解除拦截
+            # 绝不因为弹窗旧 iframe 残留去误点击或刷新！
+            if not page_ready(page):
+                log("⚠️ 遇到全页 Cloudflare 拦截，尝试处理...")
+                solve_turnstile(page, timeout=45, reload_after=None)
+
+            time.sleep(2)
 
         if not new_invoice_url:
             log("❌ 未能进入发票页面，超时。")
@@ -697,20 +711,26 @@ def renew_service(page):
             return False
 
         if page.url != new_invoice_url:
-            page.goto(new_invoice_url)
+            page.goto(new_invoice_url, wait_until="domcontentloaded", timeout=60000)
         solve_turnstile(page, timeout=60, success_check=page_ready, reload_after=8)
+        time.sleep(4)  # 给发票页面充足渲染时间
 
         log("🔎 查找 'Pay' 按钮...")
         pay_btn = page.locator('a:has-text("Pay"):visible, button:has-text("Pay"):visible').first
-        pay_btn.wait_for(state="visible", timeout=30000)
+        pay_btn.wait_for(state="visible", timeout=45000)
+        time.sleep(1)
         pay_btn.click()
         log("✅ 'Pay' 按钮已点击。")
 
-        # 等待支付确认页面或跳转回服务页
-        time.sleep(5)
+        # 等待支付确认处理完成 (放宽到 10 秒)
+        log("⏳ 等待支付结算确认 (等待 10 秒)...")
+        time.sleep(10)
+
         # 返回服务管理页面以获取新的到期时间
+        log("🔄 返回服务管理页面刷新到期时间...")
         page.goto(SERVICE_URL, wait_until="domcontentloaded", timeout=60000)
         solve_turnstile(page, timeout=60, success_check=page_ready, reload_after=8)
+        time.sleep(5)  # 给服务端数据库与缓存充足的更新时间
         return True
 
     except Exception as e:
